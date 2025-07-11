@@ -34,12 +34,12 @@ fn addEngineSources(b: *std.Build, opts: LibBuildOpts) *std.Build.Module {
             "src/components/keyboard.c",
         },
         .flags = &.{
-            if(opts.baremetal) "-DNN_BAREMETAL" else "",
-            if(opts.bit32) "-DNN_BIT32" else "",
+            if (opts.baremetal) "-DNN_BAREMETAL" else "",
+            if (opts.bit32) "-DNN_BIT32" else "",
         },
     });
 
-    if(!opts.baremetal) {
+    if (!opts.baremetal) {
         dataMod.link_libc = true; // we need a libc
         dataMod.addCSourceFiles(.{
             .files = &.{
@@ -52,6 +52,32 @@ fn addEngineSources(b: *std.Build, opts: LibBuildOpts) *std.Build.Module {
 
     return dataMod;
 }
+
+const BuildRaylib = struct {
+    step: std.Build.Step,
+    compile: *std.Build.Step.Compile,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+
+    pub fn init(b: *std.Build, compile: *std.Build.Step.Compile, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) @This() {
+        return .{
+            .step = std.Build.Step.init(.{ .name = "buildRaylib", .id = .custom, .owner = b, .makeFn = @This().build }),
+            .compile = compile,
+            .target = target,
+            .optimize = optimize,
+        };
+    }
+
+    pub fn build(step: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+        const self: *@This() = @fieldParentPtr("step", step);
+
+        const raylib = step.owner.dependency("raylib", .{ .target = self.target, .optimize = self.optimize });
+        self.compile.addIncludePath(raylib.path(raylib.builder.h_dir));
+
+        const artifact = raylib.artifact("raylib");
+        // self.compile.linkLibrary();
+    }
+};
 
 const LuaVersion = enum {
     lua52,
@@ -106,24 +132,22 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
-    const opts = LibBuildOpts {
+    const opts = LibBuildOpts{
         .target = target,
         .optimize = optimize,
         .baremetal = b.option(bool, "baremetal", "Compiles without libc integration") orelse false,
         .bit32 = target.result.ptrBitWidth() == 32,
     };
 
-    const noEmu = b.option(bool, "noEmu", "Disable compiling the emulator (fixes some build system quirks)") orelse false;
-
     const includeFiles = b.addInstallHeaderFile(b.path("src/neonucleus.h"), "neonucleus.h");
-   
+
     const engineMod = addEngineSources(b, opts);
 
     const engineStatic = b.addStaticLibrary(.{
         .name = "neonucleus",
         .root_module = engineMod,
     });
-    
+
     const engineShared = b.addSharedLibrary(.{
         .name = getSharedEngineName(os),
         .root_module = engineMod,
@@ -139,51 +163,50 @@ pub fn build(b: *std.Build) void {
     sharedStep.dependOn(&includeFiles.step);
     sharedStep.dependOn(&b.addInstallArtifact(engineShared, .{}).step);
 
-    if(!noEmu) {
-        const emulator = b.addExecutable(.{
-            .name = "neonucleus",
-            .target = target,
-            .optimize = optimize,
-        });
-        emulator.linkLibC();
+    const emulator = b.addExecutable(.{
+        .name = "neonucleus",
+        .target = target,
+        .optimize = optimize,
+    });
+    emulator.linkLibC();
 
-        const sysraylib_flag = b.option(bool, "sysraylib", "Use the system raylib instead of compiling raylib") orelse false;
-        if (sysraylib_flag) {
-            emulator.linkSystemLibrary("raylib");
-        } else {
-            const raylib = b.dependency("raylib", .{ .target = target, .optimize = optimize });
-            emulator.addIncludePath(raylib.path(raylib.builder.h_dir));
-            emulator.linkLibrary(raylib.artifact("raylib"));
-        }
+    const sysraylib_flag = b.option(bool, "sysraylib", "Use the system raylib instead of compiling raylib") orelse false;
+    if (sysraylib_flag) {
+        emulator.linkSystemLibrary("raylib");
+    } else {
+        const my_build = b.allocator.create(BuildRaylib) catch unreachable;
+        my_build.* = BuildRaylib.init(b, emulator, target, optimize);
 
-        const luaVer = b.option(LuaVersion, "lua", "The version of Lua to use.") orelse LuaVersion.lua54;
-        emulator.addCSourceFiles(.{
-            .files = &.{
-                "src/testLuaArch.c",
-                "src/emulator.c",
-            },
-            .flags = &.{
-                if(opts.baremetal) "-DNN_BAREMETAL" else "",
-                if(opts.bit32) "-DNN_BIT32" else "",
-            },
-        });
-        compileTheRightLua(b, emulator, luaVer) catch unreachable;
-
-        // forces us to link in everything too
-        emulator.linkLibrary(engineStatic);
-
-        const emulatorStep = b.step("emulator", "Builds the emulator");
-        emulatorStep.dependOn(&emulator.step);
-        emulatorStep.dependOn(&b.addInstallArtifact(emulator, .{}).step);
-
-        var run_cmd = b.addRunArtifact(emulator);
-
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-
-        const run_step = b.step("run", "Run the emulator");
-        run_step.dependOn(emulatorStep);
-        run_step.dependOn(&run_cmd.step);
+        emulator.step.dependOn(&my_build.step);
     }
+
+    const luaVer = b.option(LuaVersion, "lua", "The version of Lua to use.") orelse LuaVersion.lua54;
+    emulator.addCSourceFiles(.{
+        .files = &.{
+            "src/testLuaArch.c",
+            "src/emulator.c",
+        },
+        .flags = &.{
+            if (opts.baremetal) "-DNN_BAREMETAL" else "",
+            if (opts.bit32) "-DNN_BIT32" else "",
+        },
+    });
+    compileTheRightLua(b, emulator, luaVer) catch unreachable;
+
+    // forces us to link in everything too
+    emulator.linkLibrary(engineStatic);
+
+    const emulatorStep = b.step("emulator", "Builds the emulator");
+    emulatorStep.dependOn(&emulator.step);
+    emulatorStep.dependOn(&b.addInstallArtifact(emulator, .{}).step);
+
+    var run_cmd = b.addRunArtifact(emulator);
+
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+
+    const run_step = b.step("run", "Run the emulator");
+    run_step.dependOn(emulatorStep);
+    run_step.dependOn(&run_cmd.step);
 }
